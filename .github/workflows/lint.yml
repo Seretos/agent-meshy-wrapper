@@ -1,0 +1,95 @@
+name: lint
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate plugin.json is valid JSON
+        run: jq empty .claude-plugin/plugin.json
+
+      - name: Validate codex plugin.json is valid JSON
+        run: jq empty .codex-plugin/plugin.json
+
+      # The wrapped MCP is pinned to an exact npm version in BOTH manifests so npx
+      # reuses one cached package. A drift between them would silently give Claude
+      # and Codex different servers - and SKILL.md documents one tool inventory.
+      - name: Validate the meshy-mcp-server pin matches across manifests
+        run: |
+          CLAUDE_PIN=$(jq -r '.mcpServers.meshy.args[-1]' .claude-plugin/plugin.json)
+          CODEX_PIN=$(jq -r '.mcpServers.meshy.args[-1]' .codex-plugin/plugin.json)
+          echo "claude: $CLAUDE_PIN / codex: $CODEX_PIN"
+          case "$CLAUDE_PIN" in
+            @meshy-ai/meshy-mcp-server@[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::Pin '$CLAUDE_PIN' must be an exact @meshy-ai/meshy-mcp-server@X.Y.Z pin"; exit 1 ;;
+          esac
+          if [ "$CLAUDE_PIN" != "$CODEX_PIN" ]; then
+            echo "::error::Manifest pins differ: '$CLAUDE_PIN' vs '$CODEX_PIN'"
+            exit 1
+          fi
+          echo "Pin check: OK"
+
+      # The API key reaches the server only through userConfig on Claude. If either
+      # half of that wiring is dropped, the plugin installs cleanly and then fails
+      # on every tool call with an auth error. See AGENTS.md.
+      - name: Validate the userConfig API-key wiring
+        run: |
+          OPT=$(jq -r '.userConfig.api_key // empty' .claude-plugin/plugin.json)
+          if [ -z "$OPT" ]; then
+            echo "::error::.claude-plugin/plugin.json must declare userConfig.api_key"; exit 1
+          fi
+          for field in sensitive required; do
+            VAL=$(jq -r ".userConfig.api_key.$field" .claude-plugin/plugin.json)
+            if [ "$VAL" != "true" ]; then
+              echo "::error::userConfig.api_key.$field must be true (got '$VAL')"; exit 1
+            fi
+          done
+          ENVVAL=$(jq -r '.mcpServers.meshy.env.MESHY_API_KEY' .claude-plugin/plugin.json)
+          if [ "$ENVVAL" != '${user_config.api_key}' ]; then
+            echo "::error::mcpServers.meshy.env.MESHY_API_KEY must be '\${user_config.api_key}' (got '$ENVVAL')"; exit 1
+          fi
+          echo "userConfig wiring: OK"
+
+      # Codex has no userConfig; its manifest deliberately ships no env block so the
+      # server inherits MESHY_API_KEY from the launching environment. A hardcoded env
+      # entry here would mean someone pasted a literal key into the repo.
+      - name: Validate codex manifest declares no API key
+        run: |
+          ENVBLOCK=$(jq -r '.mcpServers.meshy.env // empty' .codex-plugin/plugin.json)
+          if [ -n "$ENVBLOCK" ]; then
+            echo "::error::.codex-plugin/plugin.json must not set an env block for the meshy server. See AGENTS.md."
+            exit 1
+          fi
+          echo "Codex manifest: OK"
+
+      - name: Validate no Meshy API key is committed
+        run: |
+          if grep -rInE 'msy_[A-Za-z0-9]{8}' --exclude-dir=.git .; then
+            echo "::error::A literal Meshy API key (msy_...) appears in the repository."
+            exit 1
+          fi
+          echo "Secret scan: OK"
+
+      - name: Validate SKILL.md has YAML frontmatter
+        run: |
+          python3 - <<'EOF'
+          import re, sys
+          text = open("skills/meshy-wrapper/SKILL.md", encoding="utf-8").read()
+          m = re.match(r"^---\n(.*?)\n---\n", text, re.DOTALL)
+          if not m:
+              print("::error::SKILL.md missing YAML frontmatter"); sys.exit(1)
+          fm = m.group(1)
+          if "name:" not in fm or "description:" not in fm:
+              print("::error::SKILL.md frontmatter missing 'name' or 'description'"); sys.exit(1)
+          print("SKILL.md: OK")
+          EOF
